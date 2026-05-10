@@ -217,7 +217,3 @@ Without documenting it clearly, someone cloning the repo would not know how to t
 ## 👤 Author
 
 **Samprit**
-
-d README.md
-git commit -m "Update README with three-terminal execution workflow"
-```
