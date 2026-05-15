@@ -127,7 +127,10 @@ class BehavioralMLEngine:
 
             host_age = max(
                 1,
-                now - profile.get("first_seen", now)
+                now - profile.get(
+                    "first_seen",
+                    now
+                )
             )
 
             successful_replies = self._safe_value(
@@ -183,12 +186,90 @@ class BehavioralMLEngine:
                 "mac_churn_rate"
             )
 
-            controller_load_impact = (
-                packets_per_second
-                * max(1.0, unique_destinations)
+            # =================================================
+            # ML ANALYSIS ONLY
+            # TRUST ENGINE DOES NOT USE THIS
+            # =================================================
+
+            trust_score = self._safe_value(
+                profile,
+                "trust_score"
             )
 
-            flow_miss_rate = failed_requests
+            inactivity = (
+                time.time()
+                - profile.get(
+                    "last_seen",
+                    time.time()
+                )
+            )
+
+            # =================================================
+            # ADVANCED ML RISK FACTORS
+            # =================================================
+
+            stability_factor = min(
+                1.0,
+                successful_replies / 100.0
+            )
+
+            unpredictability_factor = min(
+                1.0,
+                mac_churn_rate / 10.0
+            )
+
+            inactivity_factor = min(
+                1.0,
+                inactivity / 120.0
+            )
+
+            trust_penalty_factor = (
+                1.0 - (trust_score / 100.0)
+            )
+
+            adaptive_risk_factor = (
+
+                (1.0 - stability_factor)
+
+                + unpredictability_factor
+
+                + inactivity_factor
+
+                + trust_penalty_factor
+            )
+
+            adaptive_risk_factor = max(
+                0.2,
+                adaptive_risk_factor
+            )
+
+            # =================================================
+            # NETWORK RISK METRICS
+            # =================================================
+
+            controller_load_impact = (
+
+                packets_per_second
+
+                * max(
+                    1.0,
+                    unique_destinations
+                )
+            )
+
+            flow_miss_rate = (
+
+                failed_requests
+
+                / max(
+                    1.0,
+                    total_requests
+                )
+            )
+
+            # =================================================
+            # FEATURE MAP
+            # =================================================
 
             feature_map = {
 
@@ -278,31 +359,71 @@ class BehavioralMLEngine:
             }
 
             # =================================================
+            # APPLY ADVANCED ML RISK FACTOR
+            # =================================================
+
+            feature_map[
+                "controller_load_impact"
+            ] *= adaptive_risk_factor
+
+            feature_map[
+                "flow_miss_rate"
+            ] *= adaptive_risk_factor
+
+            feature_map[
+                "mac_churn_rate"
+            ] *= adaptive_risk_factor
+
+            # =================================================
             # LOG FEATURES
             # =================================================
 
-            feature_map["log_packet_count"] = np.log1p(
-                feature_map["packet_count"]
+            feature_map[
+                "log_packet_count"
+            ] = np.log1p(
+                feature_map[
+                    "packet_count"
+                ]
             )
 
-            feature_map["log_bytes_per_second"] = np.log1p(
-                feature_map["bytes_per_second"]
+            feature_map[
+                "log_bytes_per_second"
+            ] = np.log1p(
+                feature_map[
+                    "bytes_per_second"
+                ]
             )
 
-            feature_map["log_flow_miss_rate"] = np.log1p(
-                feature_map["flow_miss_rate"]
+            feature_map[
+                "log_flow_miss_rate"
+            ] = np.log1p(
+                feature_map[
+                    "flow_miss_rate"
+                ]
             )
 
-            feature_map["log_mac_churn_rate"] = np.log1p(
-                feature_map["mac_churn_rate"]
+            feature_map[
+                "log_mac_churn_rate"
+            ] = np.log1p(
+                feature_map[
+                    "mac_churn_rate"
+                ]
             )
 
-            feature_map["log_controller_load"] = np.log1p(
-                feature_map["controller_load_impact"]
+            feature_map[
+                "log_controller_load"
+            ] = np.log1p(
+                feature_map[
+                    "controller_load_impact"
+                ]
             )
 
-            feature_map["log_destination_entropy"] = np.log1p(
-                feature_map["destination_entropy"]
+            feature_map[
+                "log_destination_entropy"
+            ] = np.log1p(
+                feature_map[
+                    "destination_entropy"
+                ]
             )
 
             vector = []
@@ -318,13 +439,20 @@ class BehavioralMLEngine:
                     0.0
                 )
 
-                vector.append(float(value))
+                vector.append(
+                    float(value)
+                )
 
                 self.logger.info(
                     "ML FEATURE | %s = %.4f",
                     feature,
                     float(value)
                 )
+
+            self.logger.info(
+                "ML RISK FACTOR = %.4f",
+                adaptive_risk_factor
+            )
 
             self.logger.info(
                 "FEATURE VECTOR CREATED | length=%s",
@@ -343,7 +471,7 @@ class BehavioralMLEngine:
             return None
 
     # =====================================================
-    # RAW RISK PREDICTION
+    # RAW ML PREDICTION
     # =====================================================
 
     def predict_risk(self, feature_vector):
@@ -377,6 +505,11 @@ class BehavioralMLEngine:
 
             probability = float(
                 self.model.predict_proba(X)[0][1]
+            )
+
+            probability = max(
+                0.0,
+                min(1.0, probability)
             )
 
             self.logger.info(
@@ -424,9 +557,9 @@ class BehavioralMLEngine:
                 feature_vector
             )
 
-            # =============================================
-            # ML STATE DECISION
-            # =============================================
+            # =================================================
+            # ML DECISION
+            # =================================================
 
             if probability >= ML_BLOCK_THRESHOLD:
 

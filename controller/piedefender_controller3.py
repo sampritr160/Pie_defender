@@ -73,8 +73,11 @@ class PIEDefender3(app_manager.RyuApp):
         )
 
         self.mac_detector = None
+
         self.trust_engine = None
+
         self.ml_engine = None
+
         self.cleanup_manager = None
 
         # =================================================
@@ -155,8 +158,11 @@ class PIEDefender3(app_manager.RyuApp):
         # =================================================
 
         threading.Thread(
+
             target=self._print_status_loop,
+
             daemon=True
+
         ).start()
 
     # =====================================================
@@ -225,7 +231,8 @@ class PIEDefender3(app_manager.RyuApp):
         )
 
     # =====================================================
-    # SAFE ML EXECUTION
+    # ML EXECUTION
+    # ONLY FOR TRUSTED HOSTS
     # =====================================================
 
     def _run_behavioral_ml(
@@ -246,11 +253,28 @@ class PIEDefender3(app_manager.RyuApp):
             if profile is None:
                 return
 
-            if not isinstance(profile, dict):
+            # =================================================
+            # FIRST TRUST CYCLE
+            # INSTALL LONG FLOW ONLY
+            # NO ML YET
+            # =================================================
 
-                self.logger.error(
-                    "INVALID PROFILE TYPE FOR ML | type=%s",
-                    type(profile)
+            if not profile.get(
+                "ml_bootstrap_done",
+                False
+            ):
+
+                profile[
+                    "ml_bootstrap_done"
+                ] = True
+
+                profile[
+                    "ml_last_check"
+                ] = time.time()
+
+                self.logger.info(
+                    "ML BOOTSTRAP | mac=%s",
+                    src
                 )
 
                 return
@@ -271,22 +295,14 @@ class PIEDefender3(app_manager.RyuApp):
 
                 return
 
+            profile[
+                "ml_last_check"
+            ] = current_time
+
             self.logger.info(
                 "RUNNING ML ANALYSIS | mac=%s",
                 src
             )
-
-            self.logger.info(
-                "ML MODEL FILE = ml/piedefender_model.pkl"
-            )
-
-            self.logger.info(
-                "ML FEATURES FILE = ml/piedefender_features.pkl"
-            )
-
-            # =============================================
-            # PASS FULL PROFILE
-            # =============================================
 
             ml_result = (
                 self.ml_engine.predict_behavior(
@@ -294,13 +310,20 @@ class PIEDefender3(app_manager.RyuApp):
                 )
             )
 
-            if not isinstance(ml_result, dict):
+            if not isinstance(
+                ml_result,
+                dict
+            ):
 
                 self.logger.error(
                     "INVALID ML RESULT TYPE"
                 )
 
                 return
+
+            # =================================================
+            # ML ONLY UPDATES TRUST
+            # =================================================
 
             self.trust_engine.apply_ml_result(
                 src,
@@ -313,36 +336,53 @@ class PIEDefender3(app_manager.RyuApp):
                 )
             )
 
-            if updated_profile:
+            if updated_profile is None:
+                return
+
+            self.logger.warning(
+
+                "ML RESULT | mac=%s probability=%.4f ml_state=%s trust=%.2f",
+
+                src,
+
+                updated_profile.get(
+                    "ml_probability",
+                    0.0
+                ),
+
+                updated_profile.get(
+                    "ml_state",
+                    "UNKNOWN"
+                ),
+
+                updated_profile.get(
+                    "trust_score",
+                    0.0
+                )
+            )
+
+            # =================================================
+            # BLOCK ONLY IF REALLY BLOCKED
+            # =================================================
+
+            if (
+                updated_profile["state"]
+                == STATE_BLOCKED
+            ):
 
                 self.logger.warning(
-                    "ML RESULT | mac=%s probability=%.4f state=%s",
-                    src,
-                    updated_profile.get(
-                        "ml_probability",
-                        0.0
-                    ),
-                    updated_profile.get(
-                        "ml_state",
-                        "UNKNOWN"
-                    )
+                    "ML BLOCKED HOST | mac=%s",
+                    src
                 )
 
-                if (
-                    updated_profile["state"]
-                    == STATE_BLOCKED
-                ):
+                self.mitigator.install_mac_drop_rule(
 
-                    self.logger.warning(
-                        "ML BLOCKED HOST | mac=%s",
-                        src
-                    )
+                    datapath,
 
-                    self.mitigator.install_mac_drop_rule(
-                        datapath,
-                        src,
-                        hard_timeout=BLOCK_HARD_TIMEOUT
-                    )
+                    src,
+
+                    hard_timeout=BLOCK_HARD_TIMEOUT
+                )
 
         except Exception as e:
 
@@ -373,7 +413,7 @@ class PIEDefender3(app_manager.RyuApp):
 
             dpid = datapath.id
 
-            in_port = msg.match['in_port']
+            in_port = msg.match["in_port"]
 
             pkt = packet.Packet(msg.data)
 
@@ -392,84 +432,87 @@ class PIEDefender3(app_manager.RyuApp):
             dst = eth.dst
 
             self.logger.info(
+
                 "PACKET_IN | dpid=%s src=%s dst=%s port=%s",
+
                 dpid,
+
                 src,
+
                 dst,
+
                 in_port
             )
 
-            # =============================================
+            # =================================================
             # MAC LEARNING
-            # =============================================
+            # =================================================
 
             self.mac_table[dpid][src] = (
                 in_port
             )
 
-            # =============================================
-            # PROFILE
-            # =============================================
+            # =================================================
+            # PROFILE MANAGEMENT
+            # =================================================
+
+            profile = None
 
             if ENABLE_TRUST_ENGINE:
 
                 if not self.trust_engine.profile_exists(src):
 
                     self.trust_engine.create_profile(
+
                         src,
+
                         dpid,
+
                         in_port
                     )
 
-                else:
-
+                profile = (
                     self.trust_engine.update_profile(
                         src,
                         dst
                     )
+                )
 
-            # =============================================
-            # COMMUNICATION ANALYSIS
-            # =============================================
+                if profile:
 
-            if ENABLE_TRUST_ENGINE:
+                    state = profile["state"]
 
-                if dst != "ff:ff:ff:ff:ff:ff":
+                    # =====================================
+                    # TRUST ENGINE ONLY HANDLES
+                    # OBSERVATION + SUSPICIOUS
+                    # =====================================
 
-                    self.trust_engine.track_request(
-                        src,
-                        dst
-                    )
+                    if state != STATE_TRUSTED:
 
-                    valid_reply = (
+                        if dst != "ff:ff:ff:ff:ff:ff":
 
-                        self.trust_engine.verify_reply(
-                            src,
-                            dst
-                        )
-                    )
-
-                    if valid_reply:
-
-                        self.trust_engine.reward_valid_reply(
-                            src
-                        )
-
-                        if self.trust_engine.profile_exists(dst):
-
-                            self.trust_engine.reward_valid_reply(
-                                dst
+                            self.trust_engine.reward_behavior(
+                                src
                             )
 
-                    elif dst not in self.mac_table[dpid]:
+                        # =================================
+                        # UNKNOWN DESTINATION
+                        # =================================
 
-                        self.trust_engine.penalize_failed_request(
-                            src
-                        )
+                        if (
 
-            # =============================================
+                            dst != "ff:ff:ff:ff:ff:ff"
+
+                            and dst not in self.mac_table[dpid]
+                        ):
+
+                            self.trust_engine.penalize_behavior(
+                                src
+                            )
+
+            # =================================================
             # FORWARDING
-            # =============================================
+            # =================================================
 
             if dst in self.mac_table[dpid]:
 
@@ -484,6 +527,10 @@ class PIEDefender3(app_manager.RyuApp):
                 hard_timeout = (
                     OBS_HARD_TIMEOUT
                 )
+
+                # =============================================
+                # TRUST STATE LOGIC
+                # =============================================
 
                 if ENABLE_TRUST_ENGINE:
 
@@ -507,6 +554,10 @@ class PIEDefender3(app_manager.RyuApp):
                                 src
                             )
 
+                            # =============================
+                            # ML MODULE CONTROLS TRUSTED
+                            # =============================
+
                             self._run_behavioral_ml(
                                 datapath,
                                 src,
@@ -523,6 +574,25 @@ class PIEDefender3(app_manager.RyuApp):
 
                                 state = (
                                     updated_profile["state"]
+                                )
+
+                            # =============================
+                            # DOWNGRADED
+                            # =============================
+
+                            if state != STATE_TRUSTED:
+
+                                self.logger.warning(
+
+                                    "HOST DOWNGRADED | mac=%s new_state=%s trust=%.2f",
+
+                                    src,
+
+                                    state,
+
+                                    updated_profile[
+                                        "trust_score"
+                                    ]
                                 )
 
                             if state == STATE_BLOCKED:
@@ -563,18 +633,30 @@ class PIEDefender3(app_manager.RyuApp):
                             )
 
                             self.mitigator.install_mac_drop_rule(
+
                                 datapath,
+
                                 src,
+
                                 hard_timeout=BLOCK_HARD_TIMEOUT
                             )
 
                             return
 
+                # =============================================
+                # INSTALL FLOW
+                # =============================================
+
                 self.logger.info(
+
                     "FLOW INSTALLED | src=%s dst=%s idle=%s hard=%s",
+
                     src,
+
                     dst,
+
                     idle_timeout,
+
                     hard_timeout
                 )
 
@@ -620,16 +702,22 @@ class PIEDefender3(app_manager.RyuApp):
                 datapath.send_msg(mod)
 
                 self._send_packet(
+
                     datapath,
+
                     msg,
+
                     out_port
                 )
 
             else:
 
                 self._flood(
+
                     datapath,
+
                     msg,
+
                     in_port
                 )
 
@@ -657,6 +745,37 @@ class PIEDefender3(app_manager.RyuApp):
                 if ENABLE_TRUST_ENGINE:
 
                     self.trust_engine.apply_global_decay()
+
+                    profiles = list(
+
+                        self.trust_engine.host_profiles.keys()
+                    )
+
+                    for mac in profiles:
+
+                        decision = (
+                            self.trust_engine.should_cleanup_profile(
+                                mac
+                            )
+                        )
+
+                        if decision == "DELETE":
+
+                            self.logger.warning(
+                                "PROFILE CLEANUP | mac=%s",
+                                mac
+                            )
+
+                            self.trust_engine.remove_profile(
+                                mac
+                            )
+
+                        elif decision == "BLOCK":
+
+                            self.logger.warning(
+                                "LONG TERM BLOCK | mac=%s",
+                                mac
+                            )
 
                 self.logger.info("=" * 80)
 
@@ -707,7 +826,7 @@ class PIEDefender3(app_manager.RyuApp):
 
             buffer_id=msg.buffer_id,
 
-            in_port=msg.match['in_port'],
+            in_port=msg.match["in_port"],
 
             actions=[
 
