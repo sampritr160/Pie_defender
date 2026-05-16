@@ -548,19 +548,6 @@ Exception: No decay when trust is in protected range (73-78)
 
 ---
 
-## Author
-
-**Samprit**
-
----
-
-## License
-
-This project is for research and educational purposes.
-```
-
-This is the complete markup code. Copy and paste it directly into your `README.md` file. It includes all diagrams, formulas, tables, and code blocks with proper formatting.
-
 ## 👤 Author
 
 **Samprit**
