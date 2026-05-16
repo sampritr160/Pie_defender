@@ -1,605 +1,166 @@
+# =============================================================================
+# BEHAVIORAL ML ENGINE MODULE
+# Loads XGBoost model and predicts probability for behavioral analysis
+# ML only provides probability. Trust adjustment is applied by Trust Engine.
+# =============================================================================
+
 import os
 import time
-import joblib
 import numpy as np
-
+import joblib
+import warnings
 from config import *
 
+# Suppress XGBoost feature name warning
+warnings.filterwarnings("ignore", message="X does not have valid feature names")
 
 class BehavioralMLEngine:
-
+    
     def __init__(self, logger):
-
         self.logger = logger
-
+        self.model = None
+        self.scaler = None
+        self.feature_columns = None
+        self.trust_config = None
         self.model_loaded = False
-
-        base_dir = os.path.dirname(__file__)
-
-        self.model_path = os.path.join(
-            base_dir,
-            "..",
-            "ml",
-            "piedefender_model.pkl"
-        )
-
-        self.features_path = os.path.join(
-            base_dir,
-            "..",
-            "ml",
-            "piedefender_features.pkl"
-        )
-
+        
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        ml_dir = os.path.join(base_dir, "..", "ml", "current")
+        
+        model_path = os.path.join(ml_dir, "piedefender_model.pkl")
         try:
-
-            self.logger.info(
-                "LOADING ML MODEL FILE = %s",
-                self.model_path
-            )
-
-            self.model = joblib.load(
-                self.model_path
-            )
-
-            self.logger.info(
-                "LOADING FEATURE FILE = %s",
-                self.features_path
-            )
-
-            self.feature_columns = joblib.load(
-                self.features_path
-            )
-
-            self.logger.info(
-                "EXPECTED FEATURE COUNT = %s",
-                len(self.feature_columns)
-            )
-
-            self.logger.info(
-                "EXPECTED FEATURES = %s",
-                self.feature_columns
-            )
-
-            self.model_loaded = True
-
-            self.logger.info(
-                "PIEDEFENDER ML MODEL LOADED SUCCESSFULLY"
-            )
-
+            self.logger.info("LOADING ML MODEL FILE = %s", model_path)
+            self.model = joblib.load(model_path)
+            self.logger.info("ML MODEL LOADED SUCCESSFULLY | type=%s", type(self.model).__name__)
         except Exception as e:
-
-            self.logger.error(
-                "FAILED TO LOAD ML MODEL | %s",
-                e
-            )
-
-    # =====================================================
-    # SAFE VALUE
-    # =====================================================
-
-    def _safe_value(self, profile, key):
-
+            self.logger.error("FAILED TO LOAD ML MODEL | %s", e)
+            return
+        
+        features_path = os.path.join(ml_dir, "piedefender_features.pkl")
         try:
-
-            value = profile.get(key, 0)
-
+            self.logger.info("LOADING FEATURE FILE = %s", features_path)
+            self.feature_columns = joblib.load(features_path)
+            self.logger.info("EXPECTED FEATURE COUNT = %d", len(self.feature_columns))
+        except Exception as e:
+            self.logger.error("FAILED TO LOAD FEATURES | %s", e)
+            return
+        
+        scaler_path = os.path.join(ml_dir, "piedefender_scaler.pkl")
+        try:
+            self.logger.info("LOADING SCALER FILE = %s", scaler_path)
+            self.scaler = joblib.load(scaler_path)
+            self.logger.info("SCALER LOADED SUCCESSFULLY")
+        except Exception as e:
+            self.logger.error("FAILED TO LOAD SCALER | %s", e)
+            return
+        
+        config_path = os.path.join(ml_dir, "piedefender_trust_config.pkl")
+        try:
+            self.logger.info("LOADING TRUST CONFIG FILE = %s", config_path)
+            self.trust_config = joblib.load(config_path)
+        except Exception as e:
+            self.logger.error("FAILED TO LOAD TRUST CONFIG | %s", e)
+        
+        self.model_loaded = True
+        self.logger.info("PIEDEFENDER ML MODEL FULLY LOADED")
+    
+    def _safe_value(self, profile, key, default=0.0):
+        try:
+            value = profile.get(key, default)
             if value is None:
-                return 0.0
-
+                return float(default)
             if isinstance(value, set):
                 return float(len(value))
-
-            if isinstance(value, dict):
-                return float(len(value))
-
             return float(value)
-
         except Exception:
-
-            return 0.0
-
-    # =====================================================
-    # BUILD FEATURE VECTOR
-    # =====================================================
-
-    def build_feature_vector(self, profile):
-
+            return float(default)
+    
+    def build_feature_vector(self, profile, is_new_destination):
         try:
-
-            if profile is None:
-
-                self.logger.error(
-                    "PROFILE IS NONE"
-                )
-
+            if profile is None or not isinstance(profile, dict):
                 return None
-
-            if not isinstance(profile, dict):
-
-                self.logger.error(
-                    "PROFILE IS NOT DICT | type=%s",
-                    type(profile)
-                )
-
-                return None
-
+            
             now = time.time()
-
-            host_age = max(
-                1,
-                now - profile.get(
-                    "first_seen",
-                    now
-                )
-            )
-
-            successful_replies = self._safe_value(
-                profile,
-                "successful_replies"
-            )
-
-            failed_requests = self._safe_value(
-                profile,
-                "failed_requests"
-            )
-
-            total_requests = (
-                successful_replies
-                + failed_requests
-            )
-
-            reply_ratio = 0.0
-
-            if total_requests > 0:
-
-                reply_ratio = (
-                    successful_replies
-                    / total_requests
-                )
-
-            unique_destinations = float(
-                len(
-                    profile.get(
-                        "unique_destinations",
-                        set()
-                    )
-                )
-            )
-
-            packets_per_second = self._safe_value(
-                profile,
-                "packets_per_second"
-            )
-
-            bytes_per_second = self._safe_value(
-                profile,
-                "bytes_per_second"
-            )
-
-            destination_entropy = self._safe_value(
-                profile,
-                "destination_entropy"
-            )
-
-            mac_churn_rate = self._safe_value(
-                profile,
-                "mac_churn_rate"
-            )
-
-            # =================================================
-            # ML ANALYSIS ONLY
-            # TRUST ENGINE DOES NOT USE THIS
-            # =================================================
-
-            trust_score = self._safe_value(
-                profile,
-                "trust_score"
-            )
-
-            inactivity = (
-                time.time()
-                - profile.get(
-                    "last_seen",
-                    time.time()
-                )
-            )
-
-            # =================================================
-            # ADVANCED ML RISK FACTORS
-            # =================================================
-
-            stability_factor = min(
-                1.0,
-                successful_replies / 100.0
-            )
-
-            unpredictability_factor = min(
-                1.0,
-                mac_churn_rate / 10.0
-            )
-
-            inactivity_factor = min(
-                1.0,
-                inactivity / 120.0
-            )
-
-            trust_penalty_factor = (
-                1.0 - (trust_score / 100.0)
-            )
-
-            adaptive_risk_factor = (
-
-                (1.0 - stability_factor)
-
-                + unpredictability_factor
-
-                + inactivity_factor
-
-                + trust_penalty_factor
-            )
-
-            adaptive_risk_factor = max(
-                0.2,
-                adaptive_risk_factor
-            )
-
-            # =================================================
-            # NETWORK RISK METRICS
-            # =================================================
-
-            controller_load_impact = (
-
-                packets_per_second
-
-                * max(
-                    1.0,
-                    unique_destinations
-                )
-            )
-
-            flow_miss_rate = (
-
-                failed_requests
-
-                / max(
-                    1.0,
-                    total_requests
-                )
-            )
-
-            # =================================================
-            # FEATURE MAP
-            # =================================================
-
-            feature_map = {
-
-                "host_age":
-                    host_age,
-
-                "packet_count":
-                    self._safe_value(
-                        profile,
-                        "packet_count"
-                    ),
-
-                "failed_requests":
-                    failed_requests,
-
-                "reply_ratio":
-                    reply_ratio,
-
-                "unique_destinations":
-                    unique_destinations,
-
-                "packets_per_second":
-                    packets_per_second,
-
-                "bytes_per_second":
-                    bytes_per_second,
-
-                "avg_packet_size":
-                    self._safe_value(
-                        profile,
-                        "avg_packet_size"
-                    ),
-
-                "interarrival_mean":
-                    self._safe_value(
-                        profile,
-                        "interarrival_mean"
-                    ),
-
-                "interarrival_std":
-                    self._safe_value(
-                        profile,
-                        "interarrival_std"
-                    ),
-
-                "burstiness":
-                    self._safe_value(
-                        profile,
-                        "burstiness"
-                    ),
-
-                "destination_growth_rate":
-                    self._safe_value(
-                        profile,
-                        "destination_growth_rate"
-                    ),
-
-                "destination_entropy":
-                    destination_entropy,
-
-                "flow_miss_rate":
-                    flow_miss_rate,
-
-                "mac_churn_rate":
-                    mac_churn_rate,
-
-                "controller_load_impact":
-                    controller_load_impact,
-
-                "syn_ratio":
-                    self._safe_value(
-                        profile,
-                        "syn_ratio"
-                    ),
-
-                "icmp_ratio":
-                    self._safe_value(
-                        profile,
-                        "icmp_ratio"
-                    ),
-
-                "udp_ratio":
-                    self._safe_value(
-                        profile,
-                        "udp_ratio"
-                    )
-            }
-
-            # =================================================
-            # APPLY ADVANCED ML RISK FACTOR
-            # =================================================
-
-            feature_map[
-                "controller_load_impact"
-            ] *= adaptive_risk_factor
-
-            feature_map[
-                "flow_miss_rate"
-            ] *= adaptive_risk_factor
-
-            feature_map[
-                "mac_churn_rate"
-            ] *= adaptive_risk_factor
-
-            # =================================================
-            # LOG FEATURES
-            # =================================================
-
-            feature_map[
-                "log_packet_count"
-            ] = np.log1p(
-                feature_map[
-                    "packet_count"
-                ]
-            )
-
-            feature_map[
-                "log_bytes_per_second"
-            ] = np.log1p(
-                feature_map[
-                    "bytes_per_second"
-                ]
-            )
-
-            feature_map[
-                "log_flow_miss_rate"
-            ] = np.log1p(
-                feature_map[
-                    "flow_miss_rate"
-                ]
-            )
-
-            feature_map[
-                "log_mac_churn_rate"
-            ] = np.log1p(
-                feature_map[
-                    "mac_churn_rate"
-                ]
-            )
-
-            feature_map[
-                "log_controller_load"
-            ] = np.log1p(
-                feature_map[
-                    "controller_load_impact"
-                ]
-            )
-
-            feature_map[
-                "log_destination_entropy"
-            ] = np.log1p(
-                feature_map[
-                    "destination_entropy"
-                ]
-            )
-
-            vector = []
-
-            self.logger.info(
-                "BUILDING ML FEATURE VECTOR"
-            )
-
-            for feature in self.feature_columns:
-
-                value = feature_map.get(
-                    feature,
-                    0.0
-                )
-
-                vector.append(
-                    float(value)
-                )
-
-                self.logger.info(
-                    "ML FEATURE | %s = %.4f",
-                    feature,
-                    float(value)
-                )
-
-            self.logger.info(
-                "ML RISK FACTOR = %.4f",
-                adaptive_risk_factor
-            )
-
-            self.logger.info(
-                "FEATURE VECTOR CREATED | length=%s",
-                len(vector)
-            )
-
-            return vector
-
-        except Exception as e:
-
-            self.logger.error(
-                "FEATURE VECTOR BUILD FAILED | %s",
-                e
-            )
-
-            return None
-
-    # =====================================================
-    # RAW ML PREDICTION
-    # =====================================================
-
-    def predict_risk(self, feature_vector):
-
-        if feature_vector is None:
-
-            self.logger.error(
-                "FEATURE VECTOR IS NONE"
-            )
-
-            return 0.0
-
-        if not self.model_loaded:
-
-            self.logger.error(
-                "MODEL NOT LOADED"
-            )
-
-            return 0.0
-
-        try:
-
-            X = np.array(
-                [feature_vector],
-                dtype=np.float32
-            )
-
-            self.logger.info(
-                "RUNNING ML INFERENCE"
-            )
-
-            probability = float(
-                self.model.predict_proba(X)[0][1]
-            )
-
-            probability = max(
-                0.0,
-                min(1.0, probability)
-            )
-
-            self.logger.info(
-                "ML RISK SCORE = %.4f",
-                probability
-            )
-
-            return probability
-
-        except Exception as e:
-
-            self.logger.error(
-                "ML INFERENCE FAILED | %s",
-                e
-            )
-
-            return 0.0
-
-    # =====================================================
-    # FULL BEHAVIOR PREDICTION
-    # =====================================================
-
-    def predict_behavior(self, profile):
-
-        if not self.model_loaded:
-
-            return {
-
-                "probability": 0.0,
-
-                "state": STATE_OBSERVATION
-            }
-
-        try:
-
-            self.logger.info(
-                "RUNNING ML ANALYSIS"
-            )
-
-            feature_vector = self.build_feature_vector(
-                profile
-            )
-
-            probability = self.predict_risk(
-                feature_vector
-            )
-
-            # =================================================
-            # ML DECISION
-            # =================================================
-
-            if probability >= ML_BLOCK_THRESHOLD:
-
-                state = STATE_BLOCKED
-
-            elif probability >= ML_SUSPICIOUS_THRESHOLD:
-
-                state = STATE_SUSPICIOUS
-
-            elif probability <= ML_OBSERVATION_THRESHOLD:
-
-                state = STATE_TRUSTED
-
+            host_age = max(1.0, now - profile.get("first_seen", now))
+            
+            successful_replies = self._safe_value(profile, "successful_replies")
+            failed_requests = self._safe_value(profile, "failed_requests")
+            total_requests = successful_replies + failed_requests
+            reply_ratio = successful_replies / total_requests if total_requests > 0 else 0.0
+            
+            unique_destinations = float(len(profile.get("unique_destinations", set())))
+            destination_growth_rate = unique_destinations / host_age if host_age > 0 else 0.0
+            destination_entropy = self._safe_value(profile, "destination_entropy")
+            
+            ml_history = profile.get("ml_probability_history", [])
+            if len(ml_history) >= 2:
+                recent = ml_history[-5:] if len(ml_history) >= 5 else ml_history
+                x = np.arange(len(recent))
+                y = np.array(recent)
+                slope = np.polyfit(x, y, 1)[0]
+                ml_probability_trend = max(-0.5, min(0.5, slope))
             else:
-
-                state = STATE_OBSERVATION
-
-            self.logger.info(
-                "ML DECISION | probability=%.4f state=%s",
-                probability,
-                state
-            )
-
-            return {
-
-                "probability": probability,
-
-                "state": state
+                ml_probability_trend = 0.0
+            
+            time_since_last_seen = max(0.001, now - profile.get("last_seen", now))
+            syn_ratio = self._safe_value(profile, "syn_ratio", 0.2)
+            icmp_ratio = self._safe_value(profile, "icmp_ratio", 0.05)
+            udp_ratio = self._safe_value(profile, "udp_ratio", 0.2)
+            
+            feature_map = {
+                "host_age": host_age,
+                "reply_ratio": reply_ratio,
+                "unique_destinations": unique_destinations,
+                "destination_growth_rate": destination_growth_rate,
+                "destination_entropy": destination_entropy,
+                "ml_probability_trend": ml_probability_trend,
+                "is_new_destination": is_new_destination,
+                "time_since_last_seen": time_since_last_seen,
+                "syn_ratio": syn_ratio,
+                "icmp_ratio": icmp_ratio,
+                "udp_ratio": udp_ratio
             }
-
+            
+            feature_vector = []
+            for feature in self.feature_columns:
+                feature_vector.append(float(feature_map.get(feature, 0.0)))
+            
+            return feature_vector
+            
         except Exception as e:
-
-            self.logger.error(
-                "ML PREDICTION FAILED | %s",
-                e
-            )
-
-            return {
-
-                "probability": 0.0,
-
-                "state": STATE_OBSERVATION
-            }
+            self.logger.error("BUILD FEATURE VECTOR FAILED | %s", e)
+            return None
+    
+    def predict_risk(self, feature_vector):
+        if feature_vector is None or not self.model_loaded or self.scaler is None:
+            return 0.0
+        
+        try:
+            X = np.array([feature_vector], dtype=np.float32)
+            X_scaled = self.scaler.transform(X)
+            probability = float(self.model.predict(X_scaled)[0])
+            probability = max(0.0, min(1.0, probability))
+            return probability
+        except Exception as e:
+            self.logger.error("ML PREDICTION FAILED | %s", e)
+            return 0.0
+    
+    def predict_behavior(self, profile, is_new_destination):
+        if not self.model_loaded:
+            return {"probability": 0.0}
+        
+        try:
+            self.logger.info("RUNNING ML ANALYSIS | mac=%s", profile.get("mac", "unknown"))
+            
+            feature_vector = self.build_feature_vector(profile, is_new_destination)
+            if feature_vector is None:
+                self.logger.error("FEATURE VECTOR IS NONE")
+                return {"probability": 0.0}
+            
+            probability = self.predict_risk(feature_vector)
+            self.logger.info("ML ANALYSIS | probability=%.4f", probability)
+            return {"probability": probability}
+            
+        except Exception as e:
+            self.logger.error("PREDICT BEHAVIOR FAILED | %s", e)
+            return {"probability": 0.0}

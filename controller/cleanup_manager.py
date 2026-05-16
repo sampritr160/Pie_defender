@@ -1,313 +1,158 @@
+# =============================================================================
+# CLEANUP MANAGER MODULE
+# ONLY deletes or temporarily blocks inactive hosts.
+# Does NOT apply decay (decay is handled by Trust Engine)
+# Does NOT downgrade TRUSTED hosts (state transitions handled by Trust Engine)
+# =============================================================================
+
 import time
 import threading
-
-from config import (
-    OBSERVATION_PROFILE_TIMEOUT,
-    TRUSTED_PROFILE_TIMEOUT,
-    SUSPICIOUS_PROFILE_TIMEOUT,
-    BLOCKED_PROFILE_TIMEOUT,
-    BLOCK_HARD_TIMEOUT,
-    STATE_OBSERVATION,
-    STATE_TRUSTED,
-    STATE_SUSPICIOUS,
-    STATE_BLOCKED
-)
-
+from config import *
 
 class CleanupManager:
-
-    def __init__(
-        self,
-        logger,
-        trust_engine,
-        mitigator=None,
-        datapaths=None
-    ):
-
+    
+    def __init__(self, logger, trust_engine, mitigator=None, datapaths=None):
         self.logger = logger
-
         self.trust_engine = trust_engine
-
         self.mitigator = mitigator
-
         self.datapaths = datapaths
-
-        threading.Thread(
-
-            target=self._cleanup_loop,
-
-            daemon=True
-
-        ).start()
-
-    # =====================================================
-    # LOOP
-    # =====================================================
-
+        
+        cleanup_thread = threading.Thread(target=self._cleanup_loop, daemon=True)
+        cleanup_thread.start()
+        self.logger.info("CLEANUP MANAGER THREAD STARTED")
+    
     def _cleanup_loop(self):
-
         while True:
-
             time.sleep(30)
-
             try:
-
                 self.cleanup_profiles()
-
             except Exception as e:
-
-                self.logger.error(
-                    "CLEANUP LOOP FAILED | %s",
-                    e
-                )
-
-    # =====================================================
-    # GET TIMEOUT
-    # =====================================================
-
-    def _get_timeout(self, state):
-
-        if state == STATE_OBSERVATION:
-
-            return OBSERVATION_PROFILE_TIMEOUT
-
-        elif state == STATE_TRUSTED:
-
-            return TRUSTED_PROFILE_TIMEOUT
-
-        elif state == STATE_SUSPICIOUS:
-
-            return SUSPICIOUS_PROFILE_TIMEOUT
-
-        elif state == STATE_BLOCKED:
-
-            return BLOCKED_PROFILE_TIMEOUT
-
-        return OBSERVATION_PROFILE_TIMEOUT
-
-    # =====================================================
-    # TEMPORARY BLOCK
-    # =====================================================
-
-    def _block_host(self, mac):
-
-        if self.mitigator is None:
+                self.logger.error("CLEANUP LOOP FAILED | %s", e)
+    
+    def _install_block_rule(self, mac, datapath, duration_seconds=TEMPORARY_BLOCK_DURATION):
+        """Install OpenFlow drop rule for blocked host directly"""
+        try:
+            ofproto = datapath.ofproto
+            parser = datapath.ofproto_parser
+            
+            # Create match for source MAC
+            match = parser.OFPMatch(eth_src=mac)
+            instructions = []  # No actions = drop
+            
+            mod = parser.OFPFlowMod(
+                datapath=datapath,
+                priority=100,
+                match=match,
+                instructions=instructions,
+                hard_timeout=duration_seconds,
+                idle_timeout=0,
+                buffer_id=ofproto.OFP_NO_BUFFER
+            )
+            datapath.send_msg(mod)
+            
+            # Also block destination MAC
+            match_dst = parser.OFPMatch(eth_dst=mac)
+            mod_dst = parser.OFPFlowMod(
+                datapath=datapath,
+                priority=100,
+                match=match_dst,
+                instructions=instructions,
+                hard_timeout=duration_seconds,
+                idle_timeout=0,
+                buffer_id=ofproto.OFP_NO_BUFFER
+            )
+            datapath.send_msg(mod_dst)
+            
+            self.logger.warning("BLOCK RULE INSTALLED | mac=%s duration=%ds", mac, duration_seconds)
+            return True
+        except Exception as e:
+            self.logger.error("BLOCK RULE INSTALL FAILED | mac=%s error=%s", mac, e)
+            return False
+    
+    def _temporary_block_host(self, mac, duration_seconds=TEMPORARY_BLOCK_DURATION):
+        """Temporary block host - install block rules on all switches"""
+        if self.datapaths is None or len(self.datapaths) == 0:
+            self.logger.warning("TEMPORARY BLOCK | no datapaths available")
             return
-
-        if self.datapaths is None:
-            return
-
+        
+        block_success = False
         for datapath in self.datapaths.values():
-
-            try:
-
-                self.mitigator.install_mac_drop_rule(
-
-                    datapath,
-
-                    mac,
-
-                    hard_timeout=BLOCK_HARD_TIMEOUT
-                )
-
-                self.logger.warning(
-
-                    "TEMPORARY BLOCK INSTALLED | mac=%s timeout=%ss",
-
-                    mac,
-
-                    BLOCK_HARD_TIMEOUT
-                )
-
-            except Exception as e:
-
-                self.logger.error(
-
-                    "BLOCK INSTALL FAILED | mac=%s error=%s",
-
-                    mac,
-
-                    e
-                )
-
-    # =====================================================
-    # CLEANUP
-    # =====================================================
-
+            if self._install_block_rule(mac, datapath, duration_seconds):
+                block_success = True
+        
+        if block_success:
+            # Mark profile for deletion when block expires
+            profile = self.trust_engine.get_profile(mac)
+            if profile:
+                profile["block_until"] = time.time() + duration_seconds
+                profile["state"] = STATE_BLOCKED
+                self.logger.warning("TEMPORARY BLOCK ACTIVE | mac=%s duration=%ds", mac, duration_seconds)
+        else:
+            self.logger.error("TEMPORARY BLOCK FAILED | mac=%s", mac)
+    
+    def _delete_profile(self, mac):
+        """Delete profile completely - will be recreated if host appears again"""
+        try:
+            self.trust_engine.remove_profile(mac)
+            self.logger.warning("PROFILE DELETED | mac=%s", mac)
+        except Exception as e:
+            self.logger.error("PROFILE DELETE FAILED | mac=%s error=%s", mac, e)
+    
     def cleanup_profiles(self):
-
         now = time.time()
-
-        remove_list = []
-
-        for mac, profile in list(
-            self.trust_engine.host_profiles.items()
-        ):
-
+        deleted_count = 0
+        blocked_count = 0
+        
+        for mac, profile in list(self.trust_engine.host_profiles.items()):
             try:
-
-                last_seen = profile.get(
-                    "last_seen",
-                    now
-                )
-
-                elapsed = (
-                    now - last_seen
-                )
-
-                state = profile.get(
-                    "state",
-                    STATE_OBSERVATION
-                )
-
-                timeout = self._get_timeout(
-                    state
-                )
-
-                # =========================================
-                # STILL ACTIVE
-                # =========================================
-
-                if elapsed < timeout:
-
+                state = profile.get("state", STATE_OBSERVATION)
+                
+                # =============================================================
+                # Handle BLOCKED state - delete after block expires
+                # =============================================================
+                if state == STATE_BLOCKED:
+                    block_until = profile.get("block_until", 0)
+                    if now >= block_until and block_until > 0:
+                        self._delete_profile(mac)
+                        deleted_count += 1
+                        self.logger.info("BLOCK EXPIRED - PROFILE DELETED | mac=%s", mac)
                     continue
-
-                probability = profile.get(
-                    "ml_probability",
-                    0.0
-                )
-
-                trust = profile.get(
-                    "trust_score",
-                    0.0
-                )
-
-                # =========================================
-                # TRUSTED HOST INACTIVE
-                # RESET TO OBSERVATION
-                # =========================================
-
+                
+                # =============================================================
+                # SKIP TRUSTED HOSTS - Cleanup manager does NOT downgrade
+                # Decay and state transitions are handled by Trust Engine
+                # =============================================================
                 if state == STATE_TRUSTED:
-
-                    profile["state"] = (
-                        STATE_OBSERVATION
-                    )
-
-                    profile["trust_score"] = 50
-
-                    self.logger.warning(
-
-                        "TRUSTED HOST RESET | mac=%s trust=50.00",
-
-                        mac
-                    )
-
                     continue
-
-                # =========================================
-                # FINAL DECISION
-                # =========================================
-
-                decision = (
-                    self.trust_engine.should_cleanup_profile(
-                        mac
-                    )
-                )
-
-                # =========================================
-                # SAFE OLD HOST
-                # DELETE
-                # =========================================
-
-                if decision == "DELETE":
-
-                    remove_list.append(mac)
-
-                    self.logger.warning(
-
-                        "SAFE PROFILE EXPIRED | mac=%s state=%s trust=%.2f inactivity=%ss",
-
-                        mac,
-
-                        state,
-
-                        trust,
-
-                        int(elapsed)
-                    )
-
-                # =========================================
-                # RISKY HOST
-                # TEMPORARY BLOCK
-                # =========================================
-
-                elif decision == "BLOCK":
-
-                    self.logger.warning(
-
-                        "RISKY PROFILE DETECTED | mac=%s state=%s ml=%.4f inactivity=%ss",
-
-                        mac,
-
-                        state,
-
-                        probability,
-
-                        int(elapsed)
-                    )
-
-                    self._block_host(mac)
-
-                # =========================================
-                # KEEP PROFILE
-                # =========================================
-
+                
+                # =============================================================
+                # Handle inactive OBSERVATION/SUSPICIOUS hosts
+                # =============================================================
+                last_seen = profile.get("last_seen", now)
+                elapsed = now - last_seen
+                
+                if state == STATE_OBSERVATION:
+                    timeout = OBSERVATION_PROFILE_TIMEOUT
+                elif state == STATE_SUSPICIOUS:
+                    timeout = SUSPICIOUS_PROFILE_TIMEOUT
                 else:
-
-                    self.logger.info(
-
-                        "PROFILE RETAINED | mac=%s state=%s trust=%.2f ml=%.4f",
-
-                        mac,
-
-                        profile.get(
-                            "state"
-                        ),
-
-                        trust,
-
-                        probability
-                    )
-
+                    timeout = OBSERVATION_PROFILE_TIMEOUT
+                
+                if elapsed < timeout:
+                    continue
+                
+                # Get cleanup decision from trust engine
+                decision = self.trust_engine.should_cleanup_profile(mac)
+                
+                if decision == "DELETE":
+                    self._delete_profile(mac)
+                    deleted_count += 1
+                elif decision == "BLOCK":
+                    self._temporary_block_host(mac, TEMPORARY_BLOCK_DURATION)
+                    blocked_count += 1
+                    
             except Exception as e:
-
-                self.logger.error(
-                    "PROFILE CLEANUP CHECK FAILED | mac=%s error=%s",
-                    mac,
-                    e
-                )
-
-        # =================================================
-        # REMOVE SAFE PROFILES
-        # =================================================
-
-        for mac in remove_list:
-
-            try:
-
-                self.trust_engine.remove_profile(
-                    mac
-                )
-
-                self.logger.warning(
-                    "PROFILE CLEANED | mac=%s",
-                    mac
-                )
-
-            except Exception as e:
-
-                self.logger.error(
-                    "PROFILE DELETE FAILED | mac=%s error=%s",
-                    mac,
-                    e
-                )
+                self.logger.error("PROFILE CLEANUP CHECK FAILED | mac=%s error=%s", mac, e)
+        
+        if deleted_count > 0 or blocked_count > 0:
+            self.logger.info("CLEANUP SUMMARY | deleted=%d blocked=%d", deleted_count, blocked_count)
