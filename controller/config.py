@@ -97,8 +97,15 @@ BLOCKED_PROFILE_TIMEOUT = 300
 # =============================================================================
 # ML RISK THRESHOLDS (for cleanup decisions)
 # =============================================================================
-ML_RISK_HIGH_THRESHOLD = 0.40
+ML_RISK_HIGH_THRESHOLD = 0.50
 ML_RISK_VERY_HIGH_THRESHOLD = 0.75
+
+# =============================================================================
+# ENTROPY THRESHOLD FOR ML=0.00 HOSTS (never reached TRUSTED state)
+# Higher entropy = more destinations = wider scanning behavior
+# Range: 0.0 (single destination) to ~5.0 (many random destinations)
+# =============================================================================
+ENTROPY_BLOCK_THRESHOLD = 3.1
 
 # =============================================================================
 # TEMPORARY BLOCK DURATION (seconds)
@@ -109,4 +116,9 @@ TEMPORARY_BLOCK_DURATION = 300
 # STATUS / DEBUG
 # =============================================================================
 MAC_TABLE_PRINT_INTERVAL = 15
-PROFILE_PRINT_INTERVAL = 15
+PROFILE_PRINT_INTERVAL = 15  
+
+# =============================================================================
+# SWITCH SIDE BLOCK DURATION (seconds)
+# =============================================================================
+SWITCH_SIDE_BLOCK_DURATION = 300  # 5 minutes in seconds
