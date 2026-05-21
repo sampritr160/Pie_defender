@@ -435,3 +435,15 @@ class HostTrustEngine:
             )
         
         self.logger.info("=" * 80)
+    
+    # =========================================================================
+    # REMOVE SWITCH BLOCK FLAG (called when block expires)
+    # =========================================================================
+    
+    def remove_switch_block_flag(self, mac):
+        """Remove the switch_rule_installed flag when block expires"""
+        if mac in self.host_profiles:
+            profile = self.host_profiles[mac]
+            if profile.get("switch_rule_installed", False):
+                profile["switch_rule_installed"] = False
+                self.logger.info("SWITCH RULE FLAG CLEARED | mac=%s (block expired)", mac)

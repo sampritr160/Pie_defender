@@ -113,6 +113,8 @@ class CleanupManager:
                 if state == STATE_BLOCKED:
                     block_until = profile.get("block_until", 0)
                     if now >= block_until and block_until > 0:
+                        # Clear the switch rule flag before deletion
+                        self.trust_engine.remove_switch_block_flag(mac)
                         self._delete_profile(mac)
                         deleted_count += 1
                         self.logger.info("BLOCK EXPIRED - PROFILE DELETED | mac=%s", mac)
