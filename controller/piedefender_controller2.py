@@ -74,6 +74,36 @@ class PIEDefender2(app_manager.RyuApp):
 
         self.logger.info(f"SWITCH CONNECTED dpid={datapath.id}")
 
+    # =========================================================================
+    # NEW: Port-Status Handler for PDF Algorithm 2
+    # This is the ONLY addition to this file
+    # =========================================================================
+    @set_ev_cls(ofp_event.EventOFPPortStatus, MAIN_DISPATCHER)
+    def port_status_handler(self, ev):
+        """Handle port status changes (up/down) for MAC injection detection"""
+        msg = ev.msg
+        datapath = msg.datapath
+        port_no = msg.desc.port_no
+        reason = msg.reason
+        
+        # Only process if MAC detection is enabled
+        if PIEDEFENDER_MODE in [1, 3] and hasattr(self, 'mac_detector'):
+            # Notify MAC detector about port status change
+            self.mac_detector.notify_port_status(datapath.id, port_no)
+            
+            # Log the event for debugging
+            reason_str = {0: "ADD", 1: "DELETE", 2: "MODIFY"}.get(reason, "UNKNOWN")
+            self.logger.info(f"PORT STATUS | dpid={datapath.id} port={port_no} reason={reason_str}")
+            
+            # If port is deleted, also remove from MAC table
+            if reason == 1:  # DELETE
+                if datapath.id in self.mac_table:
+                    # Remove all MACs associated with this port
+                    macs_to_remove = [mac for mac, p in self.mac_table[datapath.id].items() if p == port_no]
+                    for mac in macs_to_remove:
+                        del self.mac_table[datapath.id][mac]
+                        self.logger.info(f"MAC REMOVED | dpid={datapath.id} mac={mac} port={port_no} (port deleted)")
+
     def _log_traffic(self, dpid, src, dst, in_port, action):
         log_entry = (
             f"{time.time():.2f} | dpid={dpid} | src={src} | "
@@ -127,11 +157,12 @@ class PIEDefender2(app_manager.RyuApp):
 
         # MAC injection detection
         if PIEDEFENDER_MODE in [1, 3]:
-            status, _ = self.mac_detector.process_packet(
+            status, details = self.mac_detector.process_packet(
                 dpid, in_port, src,
                 {"eth_type": eth.ethertype, "dst_mac": dst}
             )
 
+            # Handle different status codes
             if status == "INJECTION_DETECTED":
                 self.logger.error(
                     f"MAC INJECTION BLOCKED | dpid={dpid} port={in_port}"
@@ -140,6 +171,24 @@ class PIEDefender2(app_manager.RyuApp):
                 return
             elif status == "BLOCKED":
                 return
+            elif status == "VERIFICATION_PENDING":
+                # PDF Algorithm 2: Port is in verification mode
+                # Drop packet temporarily until verification completes
+                self.logger.debug(
+                    f"VERIFICATION PENDING | dpid={dpid} port={in_port} "
+                    f"packets={details.get('packets_received', 0)}/{details.get('packets_needed', 10)}"
+                )
+                return  # Drop packet during verification
+            elif status == "WARNING":
+                # Log warning but don't block yet (graduated response)
+                self.logger.warning(
+                    f"MAC WARNING | dpid={dpid} port={in_port} "
+                    f"expected={details.get('expected_mac')} actual={details.get('actual_mac')} "
+                    f"violation={details.get('violation_count')}/{details.get('threshold')}"
+                )
+                # Continue processing? No - drop the suspicious packet
+                return
+            # Other statuses: OK, EDGE_LEARNED, OK_INTERNAL, etc. -> continue
 
         # Learn MAC address
         if src not in self.mac_table[dpid]:
