@@ -79,6 +79,64 @@ class PIEDefender3(app_manager.RyuApp):
         datapath.send_msg(mod)
         self.logger.info("SWITCH CONNECTED | dpid=%s", datapath.id)
     
+    def install_switch_drop_rule(self, mac, datapath, duration_seconds=300):
+        """Install OpenFlow drop rule directly on switch"""
+        try:
+            ofproto = datapath.ofproto
+            parser = datapath.ofproto_parser
+            
+            # Create match for source MAC
+            match_src = parser.OFPMatch(eth_src=mac)
+            instructions = []  # Empty instructions = drop all packets
+            
+            # Install drop rule for source MAC
+            flow_mod_src = parser.OFPFlowMod(
+                datapath=datapath,
+                priority=100,
+                match=match_src,
+                instructions=instructions,
+                hard_timeout=duration_seconds,
+                idle_timeout=0,
+                buffer_id=ofproto.OFP_NO_BUFFER
+            )
+            datapath.send_msg(flow_mod_src)
+            
+            # Also block destination MAC (bidirectional blocking)
+            match_dst = parser.OFPMatch(eth_dst=mac)
+            flow_mod_dst = parser.OFPFlowMod(
+                datapath=datapath,
+                priority=100,
+                match=match_dst,
+                instructions=instructions,
+                hard_timeout=duration_seconds,
+                idle_timeout=0,
+                buffer_id=ofproto.OFP_NO_BUFFER
+            )
+            datapath.send_msg(flow_mod_dst)
+            
+            self.logger.warning("SWITCH DROP RULE INSTALLED | mac=%s dpid=%s duration=%ds", 
+                               mac, datapath.id, duration_seconds)
+            return True
+            
+        except Exception as e:
+            self.logger.error("SWITCH DROP RULE FAILED | mac=%s error=%s", mac, e)
+            return False
+
+    def block_host_on_all_switches(self, mac, duration_seconds=300):
+        """Install drop rules for blocked host on ALL connected switches"""
+        if not self.datapaths:
+            self.logger.warning("NO SWITCHES CONNECTED - cannot install drop rules")
+            return False
+        
+        success_count = 0
+        for dpid, datapath in self.datapaths.items():
+            if self.install_switch_drop_rule(mac, datapath, duration_seconds):
+                success_count += 1
+        
+        self.logger.warning("SWITCH BLOCK COMPLETE | mac=%s switches=%d/%d duration=%ds", 
+                           mac, success_count, len(self.datapaths), duration_seconds)
+        return success_count > 0
+    
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
     def packet_in_handler(self, ev):
         try:
@@ -105,11 +163,21 @@ class PIEDefender3(app_manager.RyuApp):
             
             # =============================================================
             # CRITICAL: Check if source host is BLOCKED FIRST
-            # Drop packet immediately without any processing
+            # Install switch-side drop rule on FIRST packet from blocked host
+            # Then drop subsequent packets at switch level (no controller traffic)
             # =============================================================
             if ENABLE_TRUST_ENGINE and self.trust_engine.profile_exists(src):
                 profile_check = self.trust_engine.get_profile(src)
                 if profile_check and profile_check.get("state") == STATE_BLOCKED:
+                    # Check if we already installed switch-side rule for this host
+                    if not profile_check.get("switch_rule_installed", False):
+                        # Install drop rule on all switches (5 minutes)
+                        self.block_host_on_all_switches(src, SWITCH_SIDE_BLOCK_DURATION)
+                        profile_check["switch_rule_installed"] = True
+                        profile_check["block_rule_expires"] = time.time() + SWITCH_SIDE_BLOCK_DURATION
+                        self.logger.warning("SWITCH DROP RULE TRIGGERED | mac=%s (first blocked packet)", src)
+                    
+                    # Still drop this packet at controller level
                     self.logger.warning("BLOCKED HOST PACKET DROPPED | mac=%s", src)
                     return
             
